@@ -1,0 +1,27 @@
+[package]
+name = "yaler"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.52"
+
+hyper = { version = "0.14.16", features = ["full", "stream"] }
+http = "0.2.6"
+
+rustls = "0.20.3"
+tokio-rustls = "0.23.2"
+rcgen = { version = "0.9.2", features = ["x509-parser", "pem"] }
+
+tokio = { version = "1.16.1", features = ["full"] }
+
+tracing = "0.1.30"
+tracing-subscriber = "0.3.8"
+thiserror = "1.0.30"
+
+pext = { path = "../pext", version ="*" }
+endorphin = "0.1.9"
+webpki-roots = "0.22.2"
+time = "0.3.7"
