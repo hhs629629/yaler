@@ -66,8 +66,7 @@ impl AcceptorMap {
         if host.chars().filter(|c| *c == '.').count() > 1 {
             let first_dot = host.find('.').unwrap_or_default();
             format!("*{}", &host[first_dot..])
-        }
-        else {
+        } else {
             host
         }
     }
