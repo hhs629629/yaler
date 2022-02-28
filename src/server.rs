@@ -1,11 +1,11 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use http::header::*;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper::{body::HttpBody, client, Body};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{split, AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::{
     io::{AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -13,29 +13,29 @@ use tokio::{
 
 use rustls::client::ServerName;
 use rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use pext::FromUtf8;
 use pext::IntoUtf8;
 
-use tracing::{info, instrument};
+use tracing::{error, info, instrument, warn};
 
-use crate::acceptor::Acceptor;
+use crate::acceptor::AcceptorMap;
 use crate::error::Error;
 use crate::http::ReadHttpExt;
 
 pub struct Server {
     listener: TcpListener,
-    acceptor: Acceptor,
-    tls_connector: TlsConnector,
+    acceptors: Arc<Mutex<AcceptorMap>>,
+    tls_connector: Arc<TlsConnector>,
 }
 
 impl Server {
-    #[instrument(skip(acceptor))]
+    #[instrument(skip(acceptors))]
     pub async fn bind<A>(
         addr: A,
         root_store: RootCertStore,
-        acceptor: Acceptor,
+        acceptors: Arc<Mutex<AcceptorMap>>,
     ) -> Result<Self, Error>
     where
         A: ToSocketAddrs + std::fmt::Debug,
@@ -44,18 +44,18 @@ impl Server {
             listener: TcpListener::bind(addr)
                 .await
                 .map_err(|e| Error::TcpBindError(e))?,
-            acceptor,
-            tls_connector: TlsConnector::from(Arc::new(
+            acceptors,
+            tls_connector: Arc::new(TlsConnector::from(Arc::new(
                 ClientConfig::builder()
                     .with_safe_defaults()
                     .with_root_certificates(root_store)
                     .with_no_client_auth(),
-            )),
+            ))),
         })
     }
 
     #[instrument(skip(self))]
-    pub async fn run(&mut self) -> Result<(), Error> {
+    pub async fn run(&self) -> Result<(), Error> {
         loop {
             let (stream, _addr) = self
                 .listener
@@ -63,43 +63,43 @@ impl Server {
                 .await
                 .map_err(|e| Error::TcpAcceptError(e))?;
 
-            let mut stream = BufStream::new(stream);
-            let mut buf = Vec::new();
+            let acceptors = self.acceptors.clone();
+            let connector = self.tls_connector.clone();
 
-            stream.read_until_header_end(&mut buf).await?;
-            let req = Request::from_utf8(&buf)?;
+            tokio::spawn(Self::handle_stream(stream, acceptors, connector));
+        }
+    }
 
-            info!("{:?}", req);
+    async fn handle_stream(
+        stream: TcpStream,
+        acceptors: Arc<Mutex<AcceptorMap>>,
+        connector: Arc<TlsConnector>,
+    ) {
+        let mut stream = BufStream::new(stream);
 
-            if req.method() == Method::CONNECT {
-                let remote = Self::connect_to_remote(&req, &mut stream).await.unwrap();
-                let remote = self
-                    .tls_connector
-                    .connect(
-                        ServerName::try_from(req.uri().host().unwrap()).unwrap(),
-                        remote,
-                    )
-                    .await
-                    .unwrap();
+        let mut buf = Vec::new();
+        stream.read_until_header_end(&mut buf).await.unwrap();
 
-                let stream = match self
-                    .acceptor
-                    .get(req.uri().host().unwrap().to_string())
-                    .accept(stream.into_inner())
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(_) => continue,
-                };
+        let req = Request::from_utf8(&buf).unwrap();
 
-                tokio::spawn(async move {
-                    Self::handle_https(req, remote, stream).await;
-                });
-            } else {
-                tokio::spawn(async move {
-                    Self::handle_http(req, stream).await;
-                });
+        info!(?req);
+
+        if req.method() == Method::CONNECT {
+            let host = req.uri().host().unwrap().to_string();
+            let acceptor = {
+                let mut map = acceptors.lock().unwrap();
+
+                map.get(host.clone())
+            };
+
+            let remote = Self::connect_to_remote(&req, &mut stream).await.unwrap();
+
+            match Self::handle_https(host.clone(), connector, acceptor, remote, stream.into_inner()).await {
+                Ok(_) => return,
+                Err(e) => error!(?host, ?e),
             }
+        } else {
+            Self::handle_http(req, stream).await;
         }
     }
 
@@ -126,24 +126,46 @@ impl Server {
             .body(Vec::new())
             .unwrap();
 
-        stream.write_all(&response.into_utf8().unwrap()).await;
-        stream.flush().await;
+        stream
+            .write_all(&response.into_utf8().unwrap())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
 
         connection.map_err(Error::TcpConnectError)
     }
 
+    #[instrument(skip(connector, acceptor))]
     async fn handle_https(
-        req: Request<Vec<u8>>,
-        mut remote: tokio_rustls::client::TlsStream<TcpStream>,
-        mut stream: tokio_rustls::server::TlsStream<TcpStream>,
-    ) {
-        loop {
-            let mut buf = [0u8; 1024];
-            let len = stream.read(&mut buf).await.unwrap();
-            print!("{}", String::from_utf8(buf[..len].to_vec()).unwrap());
-        }
+        host: String,
+        connector: Arc<TlsConnector>,
+        acceptor: Arc<TlsAcceptor>,
+        remote: TcpStream,
+        stream: TcpStream,
+    ) -> Result<(), Error> {
+        let remote = connector
+            .connect(ServerName::try_from(host.as_str()).unwrap(), remote)
+            .await
+            .map_err(Error::TlsConnectError)?;
+        let remote = TlsStream::Client(remote);
+
+        let stream = acceptor
+            .accept(stream)
+            .await
+            .map_err(Error::TlsAcceptError)?;
+        let stream = TlsStream::Server(stream);
+
+        let (remote_read, remote_write) = split(remote);
+        let (stream_read, stream_write) = split(stream);
+
+        let c_to_s = tokio::spawn(Self::link(stream_read, remote_write));
+        Self::link(remote_read, stream_write).await?;
+        c_to_s.await.unwrap()?;
+
+        Ok(())
     }
 
+    #[instrument]
     async fn handle_http(req: Request<Vec<u8>>, mut stream: BufStream<TcpStream>) {
         let client = client::Client::new();
         let (parts, empty) = req.into_parts();
@@ -163,15 +185,15 @@ impl Server {
             .write_all(&response.into_utf8().unwrap())
             .await
             .unwrap();
-        stream.flush().await;
+        stream.flush().await.unwrap();
 
         while !body.is_end_stream() {
             let mut pin_body = Pin::new(&mut body);
 
             if let Some(Ok(buf)) = pin_body.data().await {
                 let buf: Vec<_> = buf.to_vec();
-                stream.write_all(&buf).await;
-                stream.flush().await;
+                stream.write_all(&buf).await.unwrap();
+                stream.flush().await.unwrap();
             }
         }
     }
@@ -183,5 +205,26 @@ impl Server {
         let mut buf = Vec::with_capacity(content_length);
         stream.read_exact(&mut buf[..content_length]).await.unwrap();
         buf
+    }
+
+    #[instrument]
+    async fn link(
+        mut from: ReadHalf<TlsStream<TcpStream>>,
+        mut to: WriteHalf<TlsStream<TcpStream>>,
+    ) -> Result<(), Error> {
+        loop {
+            let mut buf = [0u8; 1024 * 10];
+
+            let len = from.read(&mut buf).await.map_err(Error::ReadStreamError)?;
+
+            if len == 0 {
+                return Ok(());
+            }
+
+            to.write_all(&buf[..len])
+                .await
+                .map_err(Error::WriteStreamError)?;
+            to.flush().await.map_err(Error::WriteStreamError)?;
+        }
     }
 }

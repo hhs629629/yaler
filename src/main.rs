@@ -5,8 +5,8 @@ mod server;
 
 use crate::server::Server;
 
-use acceptor::Acceptor;
-use rustls::{Certificate, PrivateKey, ServerConfig};
+use acceptor::AcceptorMap;
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() {
@@ -21,13 +21,14 @@ async fn main() {
         )
     }));
 
-    let acceptor = Acceptor::new(
+    let acceptor = AcceptorMap::new(
         include_str!("../cert/root.crt").to_string(),
         include_str!("../cert/key.pem").to_string(),
     );
 
-    let mut server = Server::bind("127.0.0.1:5333", root_store, acceptor)
+    let server = Server::bind("127.0.0.1:5333", root_store, Arc::new(Mutex::new(acceptor)))
         .await
         .unwrap();
+
     server.run().await.unwrap();
 }
