@@ -1,6 +1,3 @@
-use rcgen::BasicConstraints;
-use rcgen::CertificateSigningRequest;
-use rcgen::IsCa;
 use rustls::{PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
@@ -19,12 +16,12 @@ use std::ops::Add;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub struct Acceptor {
-    map: HashMap<String, TlsAcceptor, TTIPolicy>,
+pub struct AcceptorMap {
+    map: HashMap<String, Arc<TlsAcceptor>, TTIPolicy>,
     ca: Certificate,
 }
 
-impl Acceptor {
+impl AcceptorMap {
     pub fn new(ca: String, key: String) -> Self {
         let key = KeyPair::from_pem(&key).unwrap();
         let params = CertificateParams::from_ca_cert_pem(&ca, key).unwrap();
@@ -38,11 +35,11 @@ impl Acceptor {
     }
 
     #[instrument(skip(self))]
-    pub fn get(&mut self, host: String) -> &TlsAcceptor {
+    pub fn get(&mut self, host: String) -> Arc<TlsAcceptor> {
         let host = Self::normalize(host);
 
         if !self.map.contains_key(&host) {
-            let mut params = Self::BaseCertParam(host.clone());
+            let params = Self::base_cert_param(host.clone());
 
             let cert = Certificate::from_params(params).unwrap();
 
@@ -59,18 +56,23 @@ impl Acceptor {
 
             let acceptor = TlsAcceptor::from(Arc::new(cfg));
             self.map
-                .insert(host.clone(), acceptor, Duration::from_secs(3600));
+                .insert(host.clone(), Arc::new(acceptor), Duration::from_secs(3600));
+            info!("Cert for {} generated", host);
         }
-
-        self.map.get(&host).unwrap()
+        self.map.get(&host).unwrap().clone()
     }
 
     fn normalize(host: String) -> String {
-        let first_dot = host.find('.').unwrap_or_default();
-        format!("*{}", &host[first_dot..])
+        if host.chars().filter(|c| *c == '.').count() > 1 {
+            let first_dot = host.find('.').unwrap_or_default();
+            format!("*{}", &host[first_dot..])
+        }
+        else {
+            host
+        }
     }
 
-    fn BaseCertParam(host: String) -> CertificateParams {
+    fn base_cert_param(host: String) -> CertificateParams {
         use rcgen::{DnType, DnValue};
 
         let mut param = CertificateParams::default();
